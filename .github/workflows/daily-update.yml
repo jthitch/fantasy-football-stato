@@ -1,0 +1,92 @@
+name: Daily data update
+
+# Refreshes the current season from ESPN and commits espn_league.db. Streamlit
+# Community Cloud redeploys automatically when the commit lands.
+
+on:
+  schedule:
+    # 08:00 UTC - after Monday night games have finished in the US.
+    - cron: "0 8 * * *"
+  workflow_dispatch:
+    inputs:
+      year:
+        description: "Season to refresh (defaults to YEAR in get_team_details.py)"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+# Never let two runs push the database at the same time.
+concurrency:
+  group: daily-data-update
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      ESPN_S2: ${{ secrets.ESPN_S2 }}
+      SWID: ${{ secrets.SWID }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Check credentials are configured
+        run: |
+          if [ -z "$ESPN_S2" ] || [ -z "$SWID" ]; then
+            echo "::error::ESPN_S2 and SWID must be set as repository secrets"
+            exit 1
+          fi
+
+      - name: Resolve season
+        id: season
+        run: |
+          year="${{ github.event.inputs.year }}"
+          if [ -z "$year" ]; then
+            year="$(python -c 'from get_team_details import YEAR; print(YEAR)')"
+          fi
+          echo "year=$year" >> "$GITHUB_OUTPUT"
+          echo "Refreshing season $year"
+
+      - name: Refresh teams
+        run: python get_team_details.py
+
+      - name: Refresh matchups
+        run: python get_matchups.py --year "${{ steps.season.outputs.year }}"
+
+      - name: Refresh box scores
+        run: python get_box_scores.py --year "${{ steps.season.outputs.year }}"
+
+      - name: Check database size
+        run: |
+          bytes=$(stat -c%s espn_league.db)
+          echo "espn_league.db is $((bytes / 1048576)) MB"
+          # GitHub rejects any pushed file over 100 MiB.
+          if [ "$bytes" -gt 94371840 ]; then
+            echo "::error::Database is over 90 MiB and close to GitHub's push limit"
+            exit 1
+          fi
+
+      - name: Commit updated database
+        run: |
+          if git diff --quiet -- espn_league.db; then
+            echo "No new data - nothing to commit"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add espn_league.db
+          git commit -m "Update league data ($(date -u +%Y-%m-%d))"
+          git push
