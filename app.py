@@ -52,8 +52,14 @@ WIN_COLUMNS = [
 ]
 
 
+COLUMN_ACRONYMS = {"ir"}
+
+
 def format_column_title(column: str) -> str:
-    return " ".join(part.capitalize() for part in column.split("_"))
+    return " ".join(
+        part.upper() if part in COLUMN_ACRONYMS else part.capitalize()
+        for part in column.split("_")
+    )
 
 
 def display_table(df: pd.DataFrame) -> None:
@@ -113,7 +119,10 @@ SECTION_DETAILS = {
         "Bench player outscored a swappable starter: same position, "
         "or a benched RB/WR/TE vs a FLEX spot."
     ),
-    "Most points left on the bench": "Total bench points in a single week.",
+    "Most points left on the bench": (
+        "Total bench and IR points in a single week. IR Points shows how much of that "
+        "total came from players on IR."
+    ),
     "All-time player usage": "Non-bench appearances and total fantasy points.",
     "Best kickers": "Total fantasy points when started at kicker.",
     "Head-to-head records": (

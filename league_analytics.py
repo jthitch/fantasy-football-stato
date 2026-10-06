@@ -135,6 +135,24 @@ def _game_type_clause(
     return "", []
 
 
+def _completed_week_clause(alias: str) -> str:
+    """Skip weeks that are unplayed or still in progress.
+
+    ESPN leaves a matchup's winner as UNDECIDED until the week is final, and the
+    importers load the upcoming week with 0 points, so without this filter those
+    weeks show up as record-low scores. Playoff byes (away_team_id 0) stay
+    UNDECIDED forever, so they're ignored when deciding whether a week is done.
+    """
+    return f"""
+          AND NOT EXISTS (
+            SELECT 1 FROM matchups pending
+            WHERE pending.year = {alias}.year
+              AND pending.week = {alias}.week
+              AND pending.winner = 'UNDECIDED'
+              AND pending.away_team_id != 0
+          )"""
+
+
 def _is_swappable_lineup_decision(
     bench_position: str | None,
     starter_position: str | None,
@@ -168,7 +186,7 @@ def _starter_team_totals_cte(game_type: GameType = "all") -> str:
          AND bs.espn_matchup_id = bp.espn_matchup_id
         WHERE bp.slot_position NOT IN ('BE', 'IR')
           AND bp.points IS NOT NULL
-          {playoff_clause}
+          {playoff_clause}{_completed_week_clause("bp")}
         GROUP BY bp.year, bp.week, bp.team_id
     )
 """
@@ -512,7 +530,7 @@ def _load_lineup_rows(
          AND bs.espn_matchup_id = bp.espn_matchup_id
         JOIN teams t
           ON t.year = bp.year AND t.team_id = bp.team_id
-        WHERE bp.points IS NOT NULL {year_clause}{playoff_clause}
+        WHERE bp.points IS NOT NULL {year_clause}{playoff_clause}{_completed_week_clause("bp")}
     """
     with get_connection(db_path) as conn:
         rows = conn.execute(query, params).fetchall()
@@ -587,6 +605,8 @@ def most_bench_points(
             t.team_name,
             t.team_owner,
             ROUND(SUM(bp.points), 2) AS bench_points,
+            ROUND(SUM(CASE WHEN bp.slot_position = 'IR' THEN bp.points ELSE 0 END), 2)
+                AS ir_points,
             COUNT(*) AS bench_players
         FROM box_score_players bp
         JOIN box_scores bs
@@ -594,7 +614,7 @@ def most_bench_points(
          AND bs.espn_matchup_id = bp.espn_matchup_id
         JOIN teams t
           ON t.year = bp.year AND t.team_id = bp.team_id
-        WHERE bp.slot_position = 'BE' {year_clause}{playoff_clause}
+        WHERE bp.slot_position IN ('BE', 'IR') {year_clause}{playoff_clause}{_completed_week_clause("bp")}
         GROUP BY bp.year, bp.week, bp.team_id
         ORDER BY bench_points DESC
         LIMIT ?
@@ -626,7 +646,7 @@ def player_usage(
         JOIN box_scores bs
           ON bs.year = bp.year
          AND bs.espn_matchup_id = bp.espn_matchup_id
-        WHERE bp.slot_position IN ({placeholders}) {year_clause}{playoff_clause}
+        WHERE bp.slot_position IN ({placeholders}) {year_clause}{playoff_clause}{_completed_week_clause("bp")}
         GROUP BY bp.player_id, bp.player_name
         ORDER BY starts DESC, total_points DESC
         LIMIT ?
@@ -657,7 +677,7 @@ def best_kickers(
         JOIN box_scores bs
           ON bs.year = bp.year
          AND bs.espn_matchup_id = bp.espn_matchup_id
-        WHERE bp.slot_position = 'K' {year_clause}{playoff_clause}
+        WHERE bp.slot_position = 'K' {year_clause}{playoff_clause}{_completed_week_clause("bp")}
         GROUP BY bp.player_id, bp.player_name
         ORDER BY total_points DESC, starts DESC
         LIMIT ?
