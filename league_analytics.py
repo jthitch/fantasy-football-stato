@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 import sqlite3
 from pathlib import Path
-from typing import Literal
+from typing import Literal, NamedTuple
 
 import pandas as pd
 
@@ -32,6 +32,16 @@ STARTER_SLOTS = {"QB", "RB", "WR", "TE", "FLEX", "K", "D/ST", "OP", "SUPER_FLEX"
 
 FLEX_SLOTS = {"FLEX", "RB/WR", "WR/TE", "RB/WR/TE"}
 FLEX_BENCH_POSITIONS = {"RB", "WR", "TE"}
+
+FPOR_POSITIONS = {"QB", "RB", "WR", "TE", "K", "D/ST"}
+FLEX_SLOT_ELIGIBILITY = {
+    "FLEX": {"RB", "WR", "TE"},
+    "RB/WR/TE": {"RB", "WR", "TE"},
+    "RB/WR": {"RB", "WR"},
+    "WR/TE": {"WR", "TE"},
+    "OP": {"QB", "RB", "WR", "TE"},
+    "SUPER_FLEX": {"QB", "RB", "WR", "TE"},
+}
 
 
 def get_connection(db_path: Path = DEFAULT_DB_PATH) -> sqlite3.Connection:
@@ -503,6 +513,182 @@ def best_draft_picks(
     with get_connection(db_path) as conn:
         rows = conn.execute(query, params + [limit]).fetchall()
     return pd.DataFrame([dict(row) for row in rows])
+
+
+class DraftFporGrid(NamedTuple):
+    picks: pd.DataFrame
+    replacement_levels: dict[str, float]
+    weeks: list[int]
+
+
+def draft_years(db_path: Path = DEFAULT_DB_PATH) -> list[int]:
+    with get_connection(db_path) as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT year FROM draft_picks ORDER BY year DESC"
+        ).fetchall()
+    return [row["year"] for row in rows]
+
+
+def _regular_season_player_rows(year: int, db_path: Path) -> pd.DataFrame:
+    # Playoffs are left out because eliminated teams stop appearing in box
+    # scores, which would leave their players' playoff points missing.
+    query = f"""
+        SELECT
+            bp.week,
+            bp.team_id,
+            bp.player_id,
+            bp.player_name,
+            bp.player_position,
+            bp.slot_position,
+            bp.points
+        FROM box_score_players bp
+        JOIN box_scores bs
+          ON bs.year = bp.year
+         AND bs.espn_matchup_id = bp.espn_matchup_id
+        WHERE bp.year = ?
+          AND bs.is_playoff = 0
+          AND bp.points IS NOT NULL
+          {_completed_week_clause("bp")}
+    """
+    with get_connection(db_path) as conn:
+        rows = conn.execute(query, [year]).fetchall()
+    return pd.DataFrame([dict(row) for row in rows])
+
+
+def _lineup_slots_per_team(rows: pd.DataFrame) -> dict[str, int]:
+    starters = rows[~rows["slot_position"].isin(["BE", "IR"])]
+    team_weeks = len(starters[["week", "team_id"]].drop_duplicates())
+    if team_weeks == 0:
+        return {}
+    per_team = starters.groupby("slot_position").size() / team_weeks
+    return {slot: round(count) for slot, count in per_team.items() if round(count) > 0}
+
+
+def _replacement_levels(
+    totals: pd.DataFrame,
+    slots_per_team: dict[str, int],
+    team_count: int,
+) -> dict[str, float]:
+    """Points of the best player at each position who wouldn't make a starting lineup.
+
+    Every team's starting slots are filled with the highest scorers, positional
+    slots first and flex slots from whoever is left, mirroring how a league of
+    perfect managers would set lineups with this season's results.
+    """
+    pool = totals[totals["position"].isin(FPOR_POSITIONS)].sort_values(
+        "points", ascending=False
+    )
+    starters: set[int] = set()
+
+    for slot, count in slots_per_team.items():
+        if slot in FPOR_POSITIONS:
+            chosen = pool[
+                (pool["position"] == slot) & ~pool["player_id"].isin(starters)
+            ].head(count * team_count)
+            starters.update(chosen["player_id"])
+
+    for slot, count in slots_per_team.items():
+        eligible = FLEX_SLOT_ELIGIBILITY.get(slot)
+        if eligible:
+            chosen = pool[
+                pool["position"].isin(eligible) & ~pool["player_id"].isin(starters)
+            ].head(count * team_count)
+            starters.update(chosen["player_id"])
+
+    levels: dict[str, float] = {}
+    for position in FPOR_POSITIONS:
+        at_position = pool[pool["position"] == position]
+        leftover = at_position[~at_position["player_id"].isin(starters)]
+        if not leftover.empty:
+            levels[position] = float(leftover["points"].iloc[0])
+        elif not at_position.empty:
+            levels[position] = float(at_position["points"].iloc[-1])
+    return levels
+
+
+def draft_fpor_grid(year: int, db_path: Path = DEFAULT_DB_PATH) -> DraftFporGrid:
+    """Every draft pick for a season with its fantasy points over replacement (FPOR).
+
+    FPOR is a player's regular-season points so far minus the replacement level
+    for his position. Points only come from weeks the player was on a roster in
+    this league, because that's all the box scores record.
+    """
+    with get_connection(db_path) as conn:
+        pick_rows = conn.execute(
+            """
+            SELECT
+                d.round_num,
+                d.round_pick,
+                d.team_id,
+                d.player_id,
+                d.player_name,
+                t.team_name,
+                t.team_owner
+            FROM draft_picks d
+            JOIN teams t
+              ON t.year = d.year AND t.team_id = d.team_id
+            WHERE d.year = ?
+            ORDER BY d.round_num, d.round_pick
+            """,
+            [year],
+        ).fetchall()
+
+    picks = pd.DataFrame([dict(row) for row in pick_rows])
+    if picks.empty:
+        return DraftFporGrid(picks, {}, [])
+
+    team_count = picks["team_id"].nunique()
+    first_round = picks[picks["round_num"] == 1]
+    draft_slots = dict(zip(first_round["team_id"], first_round["round_pick"]))
+    picks["draft_slot"] = picks["team_id"].map(draft_slots)
+    picks["overall_pick"] = (picks["round_num"] - 1) * team_count + picks["round_pick"]
+
+    rows = _regular_season_player_rows(year, db_path)
+    if rows.empty:
+        for column in ["position", "position_rank", "points", "fpor"]:
+            picks[column] = None
+        return DraftFporGrid(picks, {}, [])
+
+    weekly = rows.groupby(["player_id", "week"], as_index=False).agg(
+        player_name=("player_name", "last"),
+        position=("player_position", "last"),
+        points=("points", "max"),
+    )
+    totals = weekly.groupby("player_id", as_index=False).agg(
+        totals_name=("player_name", "last"),
+        position=("position", "last"),
+        points=("points", "sum"),
+    )
+    totals["points"] = totals["points"].round(2)
+    totals["position_rank"] = (
+        totals.groupby("position")["points"].rank(ascending=False, method="min")
+    )
+
+    levels = _replacement_levels(totals, _lineup_slots_per_team(rows), team_count)
+
+    picks = picks.merge(totals, on="player_id", how="left")
+    picks["player_name"] = picks["player_name"].where(
+        picks["player_name"].astype(bool), picks["totals_name"]
+    )
+    picks["fpor"] = (picks["points"] - picks["position"].map(levels)).round(2)
+
+    weeks = sorted(int(week) for week in rows["week"].unique())
+    columns = [
+        "round_num",
+        "round_pick",
+        "overall_pick",
+        "draft_slot",
+        "team_id",
+        "team_name",
+        "team_owner",
+        "player_id",
+        "player_name",
+        "position",
+        "position_rank",
+        "points",
+        "fpor",
+    ]
+    return DraftFporGrid(picks[columns], levels, weeks)
 
 
 def _load_lineup_rows(

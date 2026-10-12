@@ -18,6 +18,8 @@ from league_analytics import (
     biggest_upsets,
     biggest_wins,
     current_season_highlights,
+    draft_fpor_grid,
+    draft_years,
     get_data_summary,
     head_to_head,
     highest_scoring_teams,
@@ -80,6 +82,7 @@ STAT_SECTIONS = [
     "Lowest scoring wins",
     "Highest scoring losses",
     "Best draft picks",
+    "Draft value grid",
     "Worst lineup decisions",
     "Most points left on the bench",
     "All-time player usage",
@@ -114,6 +117,11 @@ SECTION_DETAILS = {
     ),
     "Best draft picks": (
         "Most starter points from drafted players (bench and IR excluded)."
+    ),
+    "Draft value grid": (
+        "Every pick coloured by fantasy points over replacement (FPOR): regular-season "
+        "points so far minus the best player at that position who wouldn't make a "
+        "starting lineup. Green beat replacement, red fell short."
     ),
     "Worst lineup decisions": (
         "Bench player outscored a swappable starter: same position, "
@@ -257,6 +265,107 @@ def inject_global_styles() -> None:
         @keyframes ticker-scroll {
             from { transform: translateX(0); }
             to { transform: translateX(-50%); }
+        }
+        .fpor-scroll {
+            overflow-x: auto;
+            margin: 0 0 0.75rem 0;
+        }
+        .fpor-grid {
+            width: 100%;
+            min-width: 1180px;
+            table-layout: fixed;
+            border-collapse: separate;
+            border-spacing: 3px;
+            color: inherit;
+        }
+        .fpor-grid th {
+            font-size: 0.72rem;
+            font-weight: 700;
+            line-height: 1.2;
+            text-align: center;
+            vertical-align: bottom;
+            padding: 0.3rem 0.15rem;
+            border: none;
+            overflow-wrap: anywhere;
+        }
+        .fpor-grid th.fpor-round {
+            width: 2.4rem;
+            font-size: 0.9rem;
+            vertical-align: middle;
+        }
+        .fpor-owner {
+            display: block;
+            margin-top: 0.15rem;
+            font-weight: 500;
+            opacity: 0.65;
+        }
+        .fpor-grid td.fpor-cell {
+            border: none;
+            border-radius: 0.45rem;
+            padding: 0.3rem 0.2rem 0.35rem;
+            text-align: center;
+            vertical-align: top;
+            line-height: 1.15;
+        }
+        .fpor-pick {
+            font-size: 0.62rem;
+            font-weight: 600;
+            opacity: 0.75;
+        }
+        .fpor-photo {
+            display: block;
+            width: 44px;
+            height: 32px;
+            margin: 0.15rem auto 0.1rem;
+            object-fit: cover;
+        }
+        .fpor-badge {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            width: 32px;
+            height: 32px;
+            margin: 0.15rem auto 0.1rem;
+            border-radius: 50%;
+            background: rgba(151, 166, 195, 0.3);
+            font-size: 0.58rem;
+            font-weight: 700;
+        }
+        .fpor-name {
+            font-size: 0.72rem;
+            font-weight: 600;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .fpor-meta {
+            font-size: 0.6rem;
+            opacity: 0.75;
+        }
+        .fpor-value {
+            margin-top: 0.1rem;
+            font-size: 0.82rem;
+            font-weight: 700;
+        }
+        .fpor-legend {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            gap: 0.6rem;
+            font-size: 0.78rem;
+            margin-bottom: 0.4rem;
+        }
+        .fpor-legend-bar {
+            width: 220px;
+            height: 10px;
+            border-radius: 5px;
+            background: linear-gradient(
+                90deg,
+                rgba(231, 76, 60, 0.85),
+                rgba(231, 76, 60, 0.15) 45%,
+                rgba(46, 204, 113, 0.15) 55%,
+                rgba(46, 204, 113, 0.85)
+            );
         }
         @media (prefers-reduced-motion: reduce) {
             .ticker-track { animation: none; }
@@ -798,6 +907,147 @@ def render_best_draft_picks(
         display_table(drafts)
 
 
+FPOR_ABOVE_RGB = (46, 204, 113)
+FPOR_BELOW_RGB = (231, 76, 60)
+FPOR_MISSING_BACKGROUND = "rgba(151, 166, 195, 0.12)"
+ESPN_HEADSHOT_URL = (
+    "https://a.espncdn.com/combiner/i?img=/i/headshots/nfl/players/full/"
+    "{player_id}.png&w=96&h=70"
+)
+
+
+def _fpor_background(fpor: float, max_above: float, max_below: float) -> str:
+    if pd.isna(fpor):
+        return FPOR_MISSING_BACKGROUND
+    if fpor >= 0:
+        rgb, strength = FPOR_ABOVE_RGB, fpor / max_above if max_above else 0
+    else:
+        rgb, strength = FPOR_BELOW_RGB, -fpor / max_below if max_below else 0
+    alpha = 0.15 + 0.7 * min(strength, 1)
+    return f"rgba({rgb[0]}, {rgb[1]}, {rgb[2]}, {alpha:.2f})"
+
+
+def _short_player_name(name: str, position: str | None) -> str:
+    first, _, rest = name.partition(" ")
+    if position == "D/ST" or not rest:
+        return name
+    return f"{first[0]}. {rest}"
+
+
+def _fpor_cell(pick: pd.Series, max_above: float, max_below: float) -> str:
+    position = pick["position"] if isinstance(pick["position"], str) else None
+    name = pick["player_name"] if isinstance(pick["player_name"], str) else ""
+    name = name or "Unknown"
+    fpor = pick["fpor"]
+
+    # ESPN uses negative ids for team defences, which have no headshot.
+    if position == "D/ST" or int(pick["player_id"]) <= 0:
+        image = f'<div class="fpor-badge">{html.escape(position or "N/A")}</div>'
+    else:
+        url = ESPN_HEADSHOT_URL.format(player_id=int(pick["player_id"]))
+        image = f'<img class="fpor-photo" src="{url}" alt="" loading="lazy">'
+
+    if position is None:
+        meta = "Not on a roster yet"
+        value = "N/A"
+        tooltip = f"{name}: hasn't appeared in a league box score"
+    else:
+        rank = "" if pd.isna(pick["position_rank"]) else f"{int(pick['position_rank'])}"
+        fpor_text = "N/A" if pd.isna(fpor) else f"{fpor:+.1f}"
+        meta = f"{position}{rank} · {pick['points']:.1f} pts"
+        value = f"FPOR {fpor_text}"
+        tooltip = (
+            f"{name} ({position}{rank}): {pick['points']:.1f} points, FPOR {fpor_text}"
+        )
+
+    return (
+        f'<td class="fpor-cell" title="{html.escape(tooltip)}" '
+        f'style="background: {_fpor_background(fpor, max_above, max_below)}">'
+        f'<div class="fpor-pick">{pick["round_num"]}.{int(pick["round_pick"]):02d}'
+        f' · #{int(pick["overall_pick"])}</div>'
+        f"{image}"
+        f'<div class="fpor-name">{html.escape(_short_player_name(name, position))}</div>'
+        f'<div class="fpor-meta">{html.escape(meta)}</div>'
+        f'<div class="fpor-value">{value}</div>'
+        f"</td>"
+    )
+
+
+def render_draft_value_grid(
+    year_filter: int | None,
+    game_type_filter: str,
+) -> None:
+    if year_filter is None:
+        st.info("No draft data loaded yet. Run `python get_draft.py`.")
+        return
+
+    grid = draft_fpor_grid(year_filter)
+    picks = grid.picks
+    if picks.empty:
+        st.info(f"No draft loaded for {year_filter}. Run `python get_draft.py`.")
+        return
+    if not grid.weeks:
+        st.info(f"No finished regular-season weeks in {year_filter} yet.")
+
+    teams = (
+        picks.drop_duplicates("team_id")
+        .sort_values("draft_slot")[["team_id", "team_name", "team_owner"]]
+    )
+    max_above = picks["fpor"].clip(lower=0).max()
+    max_below = -picks["fpor"].clip(upper=0).min()
+    cells = {
+        (pick["round_num"], pick["team_id"]): _fpor_cell(pick, max_above, max_below)
+        for _, pick in picks.iterrows()
+    }
+
+    header = "".join(
+        f"<th>{html.escape(team.team_name)}"
+        f'<span class="fpor-owner">{html.escape(team.team_owner or "")}</span></th>'
+        for team in teams.itertuples()
+    )
+    body = "".join(
+        f'<tr><th class="fpor-round">{round_num}</th>'
+        + "".join(
+            cells.get((round_num, team_id), '<td class="fpor-cell"></td>')
+            for team_id in teams["team_id"]
+        )
+        + "</tr>"
+        for round_num in sorted(picks["round_num"].unique())
+    )
+
+    # Kept on one line: a blank or indented line inside st.markdown HTML would be
+    # parsed as markdown and break the table.
+    st.markdown(
+        f'<div class="fpor-scroll"><table class="fpor-grid">'
+        f'<thead><tr><th class="fpor-round">Rd</th>{header}</tr></thead>'
+        f"<tbody>{body}</tbody></table></div>",
+        unsafe_allow_html=True,
+    )
+
+    if grid.weeks:
+        week_range = (
+            f"week {grid.weeks[0]}"
+            if len(grid.weeks) == 1
+            else f"weeks {grid.weeks[0]}–{grid.weeks[-1]}"
+        )
+        levels = " · ".join(
+            f"{position} {grid.replacement_levels[position]:.1f}"
+            for position in ["QB", "RB", "WR", "TE", "K", "D/ST"]
+            if position in grid.replacement_levels
+        )
+        st.markdown(
+            '<div class="fpor-legend"><span>Below replacement</span>'
+            '<span class="fpor-legend-bar"></span><span>Above replacement</span>'
+            "<span>· Grey: no points recorded</span></div>",
+            unsafe_allow_html=True,
+        )
+        st.caption(
+            f"Counts finished regular-season {week_range}. Replacement level "
+            f"(points): {levels}. Points only include weeks a player was on a roster "
+            "in this league, so a drafted player left on waivers loses those weeks."
+        )
+
+
 def render_worst_lineup_decisions(
     year_filter: int | None,
     game_type_filter: str,
@@ -966,6 +1216,7 @@ SECTION_RENDERERS = {
     "Lowest scoring wins": render_lowest_scoring_wins,
     "Highest scoring losses": render_highest_scoring_losses,
     "Best draft picks": render_best_draft_picks,
+    "Draft value grid": render_draft_value_grid,
     "Worst lineup decisions": render_worst_lineup_decisions,
     "Most points left on the bench": render_most_bench_points,
     "All-time player usage": render_player_usage,
@@ -986,6 +1237,14 @@ def render_selected_section(
     points_group_by: str,
     selected_owner: str | None,
 ) -> None:
+    if section == "Draft value grid":
+        # One draft per grid, so "All time" shows the latest drafted season, and
+        # only the regular season counts towards FPOR.
+        if year_filter is None:
+            seasons = draft_years()
+            year_filter = seasons[0] if seasons else None
+        game_type_label = "Regular season"
+
     render_report_banner(section, year_filter, game_type_label)
 
     renderer = SECTION_RENDERERS[section]
